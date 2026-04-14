@@ -1,24 +1,34 @@
 /*!
- * MACRO: pexip-dialout v3.3.0
+ * MACRO: pexip-dialout v4.2.0-feature/remote-directory
  *
- * v3.3.0 - Search + pagination for large directories (500+ entries)
- * v3.2.0 - Full <Name> tags for DX70/CE9
+ * Feature branch: Remote directory support.
+ * Fetches the contact directory from a URL on startup and when the panel
+ * is opened. Falls back to the static directory in settings if fetch fails.
+ *
+ * SETTINGS: Add a "directoryUrl" to the dialOut section:
+ *
+ *   "dialOut": {
+ *     "directoryUrl": "https://intranet.example.com/pexip/directory.json",
+ *     "refreshInterval": 300,
+ *     "directory": [ ... fallback contacts ... ]
+ *   }
+ *
+ * The URL should return a JSON array:
+ *   [
+ *     { "name": "Room Alpha", "address": "alpha@example.com" },
+ *     { "name": "H.323 Room", "address": "10.0.1.50", "protocol": "h323" }
+ *   ]
+ *
+ * v4.2.0 - Remote directory fetch with fallback to static settings
+ * v4.1.0 - <n> tag for DX70; prompt-based UI
  * v3.0.0 - Standalone capable
- * v2.3.0 - Session ID for all API; protocol "auto"
  * v2.0.0 - Host check, role selection
  */
 
 import xapi from 'xapi';
 
 const MACRO = 'pexip-dialout';
-const VERSION = 'v3.3.0';
-const WIDGET = 'pex_do_';
-const WID_CUSTOM = `${WIDGET}custom`;
-const WID_SEARCH = `${WIDGET}search`;
-const WID_CLEAR = `${WIDGET}clear`;
-const WID_PREV = `${WIDGET}prev`;
-const WID_NEXT = `${WIDGET}next`;
-const PAGE_SIZE = 8; // entries per panel page (leaves room for nav row)
+const VERSION = 'v4.2.0-remote-directory';
 
 const L = {
   info: (m, msg, e) => console.info(`${VERSION} INFO  [${m}] ${msg}`, e ? JSON.stringify(e) : ''),
@@ -38,16 +48,21 @@ async function loadSettings() {
       const m = await xapi.Command.Macros.Macro.Get({ Content: true, Name: name });
       const raw = m.Macro[0].Content;
       const cfg = JSON.parse(raw.substring(raw.indexOf('{')).replace(/;\s*$/, ''));
-      if (!cfg.services?.length || !cfg.dialOut?.directory?.length) continue;
+      if (!cfg.services?.length || !cfg.dialOut) continue;
       SERVICES = cfg.services;
       DIALOUT = cfg.dialOut;
       DIALOUT.panelId = DIALOUT.panelId || 'pex_dialout_panel';
       DIALOUT.name = DIALOUT.name || 'Dial Out';
       DIALOUT.icon = DIALOUT.icon || 'Contacts';
+      DIALOUT.directory = DIALOUT.directory || [];
       DIALOUT.directory.forEach(e => { if (!e.protocol) e.protocol = 'auto'; });
-      // Sort directory alphabetically by name
-      DIALOUT.directory.sort((a, b) => a.name.localeCompare(b.name));
-      L.info('loadSettings', `Loaded from "${name}"`, { services: SERVICES.length, entries: DIALOUT.directory.length });
+      DIALOUT.refreshInterval = DIALOUT.refreshInterval || 0; // seconds, 0 = fetch on each panel open
+      L.info('loadSettings', `Loaded from "${name}"`, {
+        services: SERVICES.length,
+        staticEntries: DIALOUT.directory.length,
+        directoryUrl: DIALOUT.directoryUrl || 'none',
+        refreshInterval: DIALOUT.refreshInterval,
+      });
       return true;
     } catch { }
   }
@@ -56,30 +71,139 @@ async function loadSettings() {
 }
 
 // ---------------------------------------------------------------------------
+//  Remote directory fetch
+// ---------------------------------------------------------------------------
+let remoteDirectory = null;      // fetched entries (null = never fetched)
+let lastFetchTime = 0;           // epoch ms of last successful fetch
+let fetchInProgress = false;
+
+async function httpGet(url) {
+  try {
+    const r = await xapi.Command.HttpClient.Get(
+      { Url: url, ResultBody: 'PlainText', Timeout: 10, AllowInsecureHTTPS: false });
+    return { ok: true, body: r.Body };
+  } catch (e) {
+    return { ok: false, status: e?.data?.StatusCode || '', msg: e?.message || 'unknown' };
+  }
+}
+
+/**
+ * Fetch directory from the configured URL.
+ * Returns the parsed array or null on failure.
+ *
+ * Expected JSON format:
+ *   [
+ *     { "name": "Room Alpha", "address": "alpha@example.com" },
+ *     { "name": "H.323 Room", "address": "10.0.1.50", "protocol": "h323" }
+ *   ]
+ *
+ * Also supports a wrapper object:
+ *   { "directory": [ ... ] }
+ */
+async function fetchRemoteDirectory() {
+  const url = DIALOUT.directoryUrl;
+  if (!url) return null;
+
+  if (fetchInProgress) {
+    L.info('fetchRemoteDirectory', 'Fetch already in progress, skipping');
+    return remoteDirectory;
+  }
+
+  // Check if refresh interval hasn't elapsed
+  if (DIALOUT.refreshInterval > 0 && remoteDirectory && lastFetchTime > 0) {
+    const elapsed = (Date.now() - lastFetchTime) / 1000;
+    if (elapsed < DIALOUT.refreshInterval) {
+      L.info('fetchRemoteDirectory', `Using cached (${Math.round(elapsed)}s of ${DIALOUT.refreshInterval}s)`);
+      return remoteDirectory;
+    }
+  }
+
+  fetchInProgress = true;
+  L.info('fetchRemoteDirectory', `GET ${url}`);
+
+  const r = await httpGet(url);
+  fetchInProgress = false;
+
+  if (!r.ok) {
+    L.warn('fetchRemoteDirectory', `Fetch failed: HTTP ${r.status}`, { msg: r.msg });
+    return null;
+  }
+
+  try {
+    let entries = JSON.parse(r.body);
+
+    // Support wrapper object: { "directory": [...] }
+    if (entries && !Array.isArray(entries) && Array.isArray(entries.directory)) {
+      entries = entries.directory;
+    }
+
+    if (!Array.isArray(entries)) {
+      L.warn('fetchRemoteDirectory', 'Response is not an array');
+      return null;
+    }
+
+    // Validate and apply defaults
+    const valid = entries.filter(e => e.name && e.address).map(e => ({
+      name: String(e.name),
+      address: String(e.address),
+      protocol: String(e.protocol || 'auto'),
+    }));
+
+    valid.sort((a, b) => a.name.localeCompare(b.name));
+
+    remoteDirectory = valid;
+    lastFetchTime = Date.now();
+
+    L.info('fetchRemoteDirectory', `Fetched ${valid.length} entries`, {
+      first: valid.length > 0 ? valid[0].name : 'none',
+    });
+
+    return valid;
+  } catch (e) {
+    L.warn('fetchRemoteDirectory', `Parse error: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Get the current directory — remote if available, otherwise static fallback.
+ * Triggers a fetch if needed.
+ */
+async function getDirectory() {
+  if (DIALOUT.directoryUrl) {
+    const remote = await fetchRemoteDirectory();
+    if (remote && remote.length > 0) return remote;
+    L.info('getDirectory', 'Remote unavailable, using static fallback');
+  }
+  return DIALOUT.directory;
+}
+
+// ---------------------------------------------------------------------------
 //  HttpClient & Allow List
 // ---------------------------------------------------------------------------
 function extractHostname(url) {
   try { const m = url.match(/^https?:\/\/([^:/]+)/); return m ? m[1] : null; } catch { return null; }
 }
-async function enableHttpClient() {
-  try { await xapi.Config.HttpClient.Mode.set('On'); } catch { }
-}
-async function ensureHostnameAllowed(hostname) {
-  if (!hostname) return;
-  try {
-    const list = await xapi.Command.HttpClient.Allow.Hostname.List();
-    const existing = list.HostName || [];
-    if (existing.some(h => h.Expression === hostname)) return;
-    if (existing.length >= 10) return;
-    await xapi.Command.HttpClient.Allow.Hostname.Add({ Expression: hostname });
-    L.info('ensureHostnameAllowed', `Added: ${hostname}`);
-  } catch { }
-}
 async function ensureHttpAccess() {
-  await enableHttpClient();
+  try { await xapi.Config.HttpClient.Mode.set('On'); } catch { }
   const hostnames = new Set();
+  // Add Pexip node hostnames
   for (const svc of SERVICES) { const h = extractHostname(svc.nodeURL); if (h) hostnames.add(h); }
-  for (const h of hostnames) { await ensureHostnameAllowed(h); }
+  // Add directory URL hostname
+  if (DIALOUT.directoryUrl) {
+    const h = extractHostname(DIALOUT.directoryUrl);
+    if (h) hostnames.add(h);
+  }
+  for (const hostname of hostnames) {
+    try {
+      const list = await xapi.Command.HttpClient.Allow.Hostname.List();
+      const existing = list.HostName || [];
+      if (!existing.some(h => h.Expression === hostname) && existing.length < 10) {
+        await xapi.Command.HttpClient.Allow.Hostname.Add({ Expression: hostname });
+        L.info('ensureHttpAccess', `Added to allow list: ${hostname}`);
+      }
+    } catch { }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +231,6 @@ function teardown() {
   if (conf.timer) clearInterval(conf.timer);
   if (conf.token) post(apiUrl('release_token'), hdrs(), '').catch(() => { });
   conf = freshState();
-  searchState.query = null;
-  searchState.page = 1;
   L.info('teardown', 'Disconnected');
 }
 function apiUrl(ep) { return `${conf.nodeURL}/${conf.sessionId}/${ep}`; }
@@ -225,7 +347,7 @@ async function dialOut(destination, protocol, role) {
 }
 
 // ---------------------------------------------------------------------------
-//  UI
+//  UI helpers
 // ---------------------------------------------------------------------------
 function notify(title, text, dur) {
   xapi.Command.UserInterface.Message.Alert.Display({ Title: title, Text: text, Duration: dur || 5 }).catch(() => { });
@@ -234,226 +356,173 @@ function esc(s) {
   const m = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
   return String(s).replace(/[&<>"']/g, c => m[c]);
 }
-function promptRole(destination) {
+function showPrompt(title, text, options) {
   return new Promise(resolve => {
-    const fbId = 'pex_do_role_' + Date.now();
-    xapi.Command.UserInterface.Message.Prompt.Display({
-      FeedbackId: fbId, Title: 'Select Role',
-      Text: `Dial ${destination} as:`,
-      'Option.1': 'Guest', 'Option.2': 'Host', 'Option.3': 'Cancel',
-      Duration: 30,
-    }).catch(() => resolve(null));
+    const fbId = 'pex_do_' + Date.now();
+    const params = { FeedbackId: fbId, Title: title, Text: text, Duration: 60 };
+    options.forEach((opt, i) => { params[`Option.${i + 1}`] = opt; });
+    xapi.Command.UserInterface.Message.Prompt.Display(params).catch(() => resolve(null));
     const h1 = xapi.Event.UserInterface.Message.Prompt.Response.on(ev => {
-      if (ev.FeedbackId !== fbId) return; h1();
-      resolve(ev.OptionId === '1' ? 'GUEST' : ev.OptionId === '2' ? 'HOST' : null);
+      if (ev.FeedbackId !== fbId) return; h1(); h2();
+      resolve(parseInt(ev.OptionId, 10));
     });
     const h2 = xapi.Event.UserInterface.Message.Prompt.Cleared.on(ev => {
-      if (ev.FeedbackId !== fbId) return; h2(); resolve(null);
+      if (ev.FeedbackId !== fbId) return; h1(); h2();
+      resolve(null);
+    });
+  });
+}
+function showTextInput(title, text, placeholder, submitText) {
+  return new Promise(resolve => {
+    const fbId = 'pex_do_ti_' + Date.now();
+    xapi.Command.UserInterface.Message.TextInput.Display({
+      FeedbackId: fbId, InputType: 'SingleLine',
+      Title: title, Text: text,
+      Placeholder: placeholder, SubmitText: submitText || 'OK',
+    }).catch(() => resolve(null));
+    const h1 = xapi.Event.UserInterface.Message.TextInput.Response.on(ev => {
+      if (ev.FeedbackId !== fbId) return; h1(); h2();
+      resolve(ev.Text || null);
+    });
+    const h2 = xapi.Event.UserInterface.Message.TextInput.Clear.on(ev => {
+      if (ev.FeedbackId !== fbId) return; h1(); h2();
+      resolve(null);
     });
   });
 }
 
 // ---------------------------------------------------------------------------
-//  Search & pagination state
+//  Prompt-based directory browser
 // ---------------------------------------------------------------------------
-const searchState = {
-  query: null,
-  page: 1,
-};
+async function showMainMenu() {
+  // Fetch/refresh directory each time the menu opens
+  const directory = await getDirectory();
+  const total = directory.length;
 
-function getFilteredDirectory() {
-  if (!DIALOUT) return [];
-  const dir = DIALOUT.directory;
-  if (!searchState.query) return dir;
-  const q = searchState.query.toLowerCase();
-  return dir.filter(e =>
-    e.name.toLowerCase().includes(q) ||
-    e.address.toLowerCase().includes(q)
+  if (total === 0) {
+    notify('Dial Out', 'No contacts available.', 5);
+    return;
+  }
+
+  const source = (DIALOUT.directoryUrl && remoteDirectory) ? '(remote)' : '(local)';
+  const choice = await showPrompt(
+    'Dial Out',
+    `${total} contacts ${source}. Choose an option:`,
+    ['Browse Directory', 'Search by Name', 'Dial Custom Address']
   );
+  if (choice === 1) await browseDirectory(directory, 0);
+  else if (choice === 2) await searchDirectory(directory);
+  else if (choice === 3) await customDial();
 }
 
-function getPagedDirectory() {
-  const filtered = getFilteredDirectory();
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  if (searchState.page > totalPages) searchState.page = totalPages;
-  if (searchState.page < 1) searchState.page = 1;
-  const start = (searchState.page - 1) * PAGE_SIZE;
-  const page = filtered.slice(start, start + PAGE_SIZE);
-  return { entries: page, currentPage: searchState.page, totalPages, totalFiltered: filtered.length, startIndex: start };
+async function browseDirectory(entries, offset) {
+  if (entries.length === 0) { notify('No Results', 'No contacts found.', 3); return; }
+  const ITEMS = 3;
+  const totalPages = Math.ceil(entries.length / ITEMS);
+  const currentPage = Math.floor(offset / ITEMS) + 1;
+  const pageEntries = entries.slice(offset, offset + ITEMS);
+  const isFirst = offset === 0;
+  const isLast = offset + ITEMS >= entries.length;
+  const options = pageEntries.map(e => e.name);
+  if (!isFirst && !isLast) { options.push('← Previous'); options.push('Next →'); }
+  else if (!isFirst) { options.push('← Back'); }
+  else if (!isLast) { options.push('Next →'); }
+  const title = `Directory (${currentPage}/${totalPages})`;
+  const choice = await showPrompt(title,
+    `Showing ${offset + 1}-${Math.min(offset + ITEMS, entries.length)} of ${entries.length}`,
+    options);
+  if (!choice) return;
+  const count = pageEntries.length;
+  if (choice <= count) {
+    await selectContact(pageEntries[choice - 1], entries, offset);
+  } else {
+    const nav = options[choice - 1];
+    if (nav.includes('Previous') || nav.includes('Back')) await browseDirectory(entries, Math.max(0, offset - ITEMS));
+    else if (nav.includes('Next')) await browseDirectory(entries, offset + ITEMS);
+  }
+}
+
+async function searchDirectory(directory) {
+  const query = await showTextInput('Search Directory',
+    `Search ${directory.length} contacts by name or address.`,
+    'Enter search term', 'Search');
+  if (!query) return;
+  const q = query.toLowerCase();
+  const results = directory.filter(e =>
+    e.name.toLowerCase().includes(q) || e.address.toLowerCase().includes(q));
+  L.info('searchDirectory', `"${query}" → ${results.length} results`);
+  if (results.length === 0) {
+    const retry = await showPrompt('No Results', `No contacts matching "${query}".`,
+      ['Search Again', 'Browse All', 'Cancel']);
+    if (retry === 1) await searchDirectory(directory);
+    else if (retry === 2) await browseDirectory(directory, 0);
+    return;
+  }
+  await browseDirectory(results, 0);
+}
+
+async function selectContact(entry, parentList, parentOffset) {
+  const role = await showPrompt(`Dial: ${entry.name}`, `Address: ${entry.address}`,
+    ['Dial as Guest', 'Dial as Host', 'Back', 'Cancel']);
+  if (role === 1) { if (await attach()) await dialOut(entry.address, entry.protocol, 'GUEST'); }
+  else if (role === 2) { if (await attach()) await dialOut(entry.address, entry.protocol, 'HOST'); }
+  else if (role === 3) { await browseDirectory(parentList, parentOffset); }
+}
+
+async function customDial() {
+  const addr = await showTextInput('Dial Custom Address',
+    'Enter the SIP URI, H.323 address, or Teams address.',
+    'user@example.com', 'Next');
+  if (!addr || !addr.trim()) return;
+  const address = addr.trim();
+  let protocol = 'auto';
+  if (/^rtmps?:\/\//i.test(address)) protocol = 'rtmp';
+  const role = await showPrompt('Dial Custom', `Address: ${address}`,
+    ['Dial as Guest', 'Dial as Host', 'Cancel']);
+  if (role === 1 || role === 2) {
+    if (await attach()) await dialOut(address, protocol, role === 1 ? 'GUEST' : 'HOST');
+  }
 }
 
 // ---------------------------------------------------------------------------
-//  Panel XML with search + pagination
+//  Panel
 // ---------------------------------------------------------------------------
 function buildPanel() {
   const dc = DIALOUT;
-  const title = esc(dc.name);
-  const { entries, currentPage, totalPages, totalFiltered, startIndex } = getPagedDirectory();
-
-  // Search row
-  const searchLabel = searchState.query
-    ? `Search: ${esc(searchState.query)} (${totalFiltered})`
-    : `${dc.directory.length} contacts`;
-
-  const searchRow = searchState.query
-    ? `<Row><n>${searchLabel}</n><Widget><WidgetId>${WID_CLEAR}</WidgetId><n>Clear</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`
-    : `<Row><n>${searchLabel}</n><Widget><WidgetId>${WID_SEARCH}</WidgetId><n>Search</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`;
-
-  // Directory entry rows
-  const rows = entries.map((e, i) => {
-    const globalIdx = startIndex + i;
-    const proto = e.protocol !== 'auto' ? ` [${e.protocol.toUpperCase()}]` : '';
-    const label = esc(e.name + proto);
-    return `<Row><n>${label}</n><Widget><WidgetId>${WIDGET}e${globalIdx}</WidgetId><Name/><Type>Button</Type><Options>size=1;icon=phone</Options></Widget></Row>`;
-  }).join('\n');
-
-  // Pagination row (only if more than one page)
-  let navRow = '';
-  if (totalPages > 1) {
-    navRow = `<Row><n>Page ${currentPage} of ${totalPages}</n><Widget><WidgetId>${WID_PREV}</WidgetId><n>Prev</n><Type>Button</Type><Options>size=1</Options></Widget><Widget><WidgetId>${WID_NEXT}</WidgetId><n>Next</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`;
-  }
-
-  // Custom dial row
-  const customRow = `<Row><n>Custom Address</n><Widget><WidgetId>${WID_CUSTOM}</WidgetId><n>Dial</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`;
-
-  return `<Extensions>
-<Version>1.7</Version>
-<Panel>
-  <PanelId>${dc.panelId}</PanelId>
-  <Origin>local</Origin>
-  <Type>InCall</Type>
-  ${dc.color ? `<Color>${dc.color}</Color>` : ''}
-  <n>${title}</n>
-  <ActivityType>Custom</ActivityType>
-  <Icon>${dc.icon}</Icon>
-  <Page>
-    <n>${title}</n>
-    ${searchRow}
-    ${rows}
-    <Row><Name/></Row>
-    ${navRow}
-    ${customRow}
-    <Options/>
-  </Page>
-</Panel>
-</Extensions>`;
-}
-
-async function updatePanel() {
-  const panelId = DIALOUT.panelId;
-  const xml = buildPanel();
-  try {
-    await xapi.Command.UserInterface.Extensions.Panel.Save({ PanelId: panelId }, xml);
-  } catch (e) { L.error('updatePanel', e.message); }
+  return '<Extensions>\n'
+    + '  <Version>1.7</Version>\n'
+    + '  <Panel>\n'
+    + '    <PanelId>' + dc.panelId + '</PanelId>\n'
+    + '    <Origin>local</Origin>\n'
+    + '    <Type>InCall</Type>\n'
+    + '    <Icon>' + dc.icon + '</Icon>\n'
+    + (dc.color ? '    <Color>' + dc.color + '</Color>\n' : '')
+    + '    <Name>' + esc(dc.name) + '</Name>\n'
+    + '    <ActivityType>Custom</ActivityType>\n'
+    + '  </Panel>\n'
+    + '</Extensions>';
 }
 
 async function deployPanel() {
   const panelId = DIALOUT.panelId;
   try { await xapi.Command.UserInterface.Extensions.Panel.Remove({ PanelId: panelId }); } catch { }
-  searchState.query = null;
-  searchState.page = 1;
-  await updatePanel();
-  L.info('deployPanel', 'OK', { entries: DIALOUT.directory.length });
+  const xml = buildPanel();
+  try {
+    await xapi.Command.UserInterface.Extensions.Panel.Save({ PanelId: panelId }, xml);
+    L.info('deployPanel', 'OK');
+  } catch (e) { L.error('deployPanel', e.message); }
 }
 
 // ---------------------------------------------------------------------------
 //  Event handlers
 // ---------------------------------------------------------------------------
-async function onWidget(event) {
-  if (event.Type !== 'clicked' || !event.WidgetId.startsWith(WIDGET)) return;
-  const wid = event.WidgetId;
-
-  // Search button
-  if (wid === WID_SEARCH) {
-    xapi.Command.UserInterface.Message.TextInput.Display({
-      FeedbackId: 'pex_do_search', InputType: 'SingleLine',
-      Title: 'Search Directory',
-      Text: `Search ${DIALOUT.directory.length} contacts by name or address.`,
-      Placeholder: 'Enter search term', SubmitText: 'Search',
-    }).catch(() => { });
-    return;
-  }
-
-  // Clear search
-  if (wid === WID_CLEAR) {
-    searchState.query = null;
-    searchState.page = 1;
-    await updatePanel();
-    return;
-  }
-
-  // Pagination
-  if (wid === WID_PREV) {
-    if (searchState.page > 1) { searchState.page--; await updatePanel(); }
-    return;
-  }
-  if (wid === WID_NEXT) {
-    const { totalPages } = getPagedDirectory();
-    if (searchState.page < totalPages) { searchState.page++; await updatePanel(); }
-    return;
-  }
-
-  // Custom dial
-  if (wid === WID_CUSTOM) {
-    xapi.Command.UserInterface.Message.TextInput.Display({
-      FeedbackId: 'pex_do_custom', InputType: 'SingleLine',
-      Title: 'Dial Out — Custom Address',
-      Text: 'Enter the SIP URI, H.323 address, or Teams address.',
-      Placeholder: 'user@example.com', SubmitText: 'Next',
-    }).catch(() => { });
-    return;
-  }
-
-  // Directory entry
-  if (wid.startsWith(`${WIDGET}e`)) {
-    const idx = parseInt(wid.replace(`${WIDGET}e`, ''), 10);
-    const entry = DIALOUT.directory[idx];
-    if (!entry) return;
-    if (!(await attach())) return;
-    const role = await promptRole(entry.name);
-    if (!role) return;
-    await dialOut(entry.address, entry.protocol, role);
-  }
-}
-
-async function onTextInput(event) {
-  // Search response
-  if (event.FeedbackId === 'pex_do_search') {
-    const q = (event.Text || '').trim();
-    if (!q) return;
-    searchState.query = q;
-    searchState.page = 1;
-    L.info('onTextInput', `Search: "${q}"`, { results: getFilteredDirectory().length });
-    await updatePanel();
-    return;
-  }
-
-  // Custom dial response
-  if (event.FeedbackId === 'pex_do_custom') {
-    const addr = (event.Text || '').trim();
-    if (!addr) { notify('Dial Out', 'No address entered.', 3); return; }
-    let protocol = 'auto';
-    if (/^rtmps?:\/\//i.test(addr)) protocol = 'rtmp';
-    if (!(await attach())) return;
-    const role = await promptRole(addr);
-    if (!role) return;
-    await dialOut(addr, protocol, role);
-  }
-}
-
 async function onPanelClick(event) {
   if (!DIALOUT || event.PanelId !== DIALOUT.panelId) return;
+  xapi.Command.UserInterface.Extensions.Panel.Close().catch(() => { });
   const ok = await attach();
-  if (!ok) {
-    notify('Dial Out Unavailable', 'Could not connect to the Pexip conference.', 5);
-    xapi.Command.UserInterface.Extensions.Panel.Close();
-    return;
-  }
-  if (conf.role !== 'HOST') {
-    notify('Dial Out', `Connected as ${conf.role}. Only Hosts can dial out.`, 5);
-  }
-  // Refresh panel to show current page
-  await updatePanel();
+  if (!ok) { notify('Dial Out Unavailable', 'Could not connect to the Pexip conference.', 5); return; }
+  if (conf.role !== 'HOST') { notify('Dial Out', `Connected as ${conf.role}. Only Hosts can dial out.`, 5); return; }
+  await showMainMenu();
 }
 
 // ---------------------------------------------------------------------------
@@ -463,10 +532,17 @@ async function init() {
   L.info('init', `Starting ${MACRO} ${VERSION}`);
   if (!(await loadSettings())) { L.error('init', 'Cannot start'); return; }
   await ensureHttpAccess();
+
+  // Initial directory fetch (non-blocking — falls back to static)
+  if (DIALOUT.directoryUrl) {
+    fetchRemoteDirectory().then(entries => {
+      if (entries) L.info('init', `Remote directory pre-fetched: ${entries.length} entries`);
+      else L.info('init', 'Remote directory unavailable, will use static fallback');
+    });
+  }
+
   await deployPanel();
-  xapi.Event.UserInterface.Extensions.Widget.Action.on(onWidget);
   xapi.Event.UserInterface.Extensions.Panel.Clicked.on(onPanelClick);
-  xapi.Event.UserInterface.Message.TextInput.Response.on(onTextInput);
   xapi.Event.CallDisconnect.on(teardown);
   L.info('init', 'Ready');
 }
