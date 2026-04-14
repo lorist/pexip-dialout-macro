@@ -1,20 +1,24 @@
 /*!
- * MACRO: pexip-dialout v3.1.0
+ * MACRO: pexip-dialout v3.3.0
  *
- * Dial out participants from a Pexip Infinity VMR via the in-call panel
- * on Cisco CE/RoomOS endpoints. Standalone or alongside call-macro.
- *
- * v3.1.0 - Always Version 1.7 in XML; match call-macro whitespace/structure
- * v3.0.1 - Fix XML element order
+ * v3.3.0 - Search + pagination for large directories (500+ entries)
+ * v3.2.0 - Full <Name> tags for DX70/CE9
  * v3.0.0 - Standalone capable
+ * v2.3.0 - Session ID for all API; protocol "auto"
+ * v2.0.0 - Host check, role selection
  */
 
 import xapi from 'xapi';
 
 const MACRO = 'pexip-dialout';
-const VERSION = 'v3.1.0';
+const VERSION = 'v3.3.0';
 const WIDGET = 'pex_do_';
 const WID_CUSTOM = `${WIDGET}custom`;
+const WID_SEARCH = `${WIDGET}search`;
+const WID_CLEAR = `${WIDGET}clear`;
+const WID_PREV = `${WIDGET}prev`;
+const WID_NEXT = `${WIDGET}next`;
+const PAGE_SIZE = 8; // entries per panel page (leaves room for nav row)
 
 const L = {
   info: (m, msg, e) => console.info(`${VERSION} INFO  [${m}] ${msg}`, e ? JSON.stringify(e) : ''),
@@ -41,6 +45,8 @@ async function loadSettings() {
       DIALOUT.name = DIALOUT.name || 'Dial Out';
       DIALOUT.icon = DIALOUT.icon || 'Contacts';
       DIALOUT.directory.forEach(e => { if (!e.protocol) e.protocol = 'auto'; });
+      // Sort directory alphabetically by name
+      DIALOUT.directory.sort((a, b) => a.name.localeCompare(b.name));
       L.info('loadSettings', `Loaded from "${name}"`, { services: SERVICES.length, entries: DIALOUT.directory.length });
       return true;
     } catch { }
@@ -56,8 +62,7 @@ function extractHostname(url) {
   try { const m = url.match(/^https?:\/\/([^:/]+)/); return m ? m[1] : null; } catch { return null; }
 }
 async function enableHttpClient() {
-  try { await xapi.Config.HttpClient.Mode.set('On'); L.info('enableHttpClient', 'OK'); }
-  catch (e) { L.error('enableHttpClient', e.message); }
+  try { await xapi.Config.HttpClient.Mode.set('On'); } catch { }
 }
 async function ensureHostnameAllowed(hostname) {
   if (!hostname) return;
@@ -65,10 +70,10 @@ async function ensureHostnameAllowed(hostname) {
     const list = await xapi.Command.HttpClient.Allow.Hostname.List();
     const existing = list.HostName || [];
     if (existing.some(h => h.Expression === hostname)) return;
-    if (existing.length >= 10) { L.warn('ensureHostnameAllowed', 'Allow list full'); return; }
+    if (existing.length >= 10) return;
     await xapi.Command.HttpClient.Allow.Hostname.Add({ Expression: hostname });
     L.info('ensureHostnameAllowed', `Added: ${hostname}`);
-  } catch (e) { L.warn('ensureHostnameAllowed', e.message); }
+  } catch { }
 }
 async function ensureHttpAccess() {
   await enableHttpClient();
@@ -102,6 +107,8 @@ function teardown() {
   if (conf.timer) clearInterval(conf.timer);
   if (conf.token) post(apiUrl('release_token'), hdrs(), '').catch(() => { });
   conf = freshState();
+  searchState.query = null;
+  searchState.page = 1;
   L.info('teardown', 'Disconnected');
 }
 function apiUrl(ep) { return `${conf.nodeURL}/${conf.sessionId}/${ep}`; }
@@ -139,18 +146,17 @@ async function acquireToken() {
   const url = apiUrl('request_token');
   const headers = ['Content-Type: application/json'];
   if (conf.alias) headers.push(`Conference-Alias: ${conf.alias}`);
-  L.info('acquireToken', `POST ${url}`);
   const r = await post(url, headers, JSON.stringify({ display_name: name, client_id: `${MACRO}/${VERSION}` }));
   if (!r.ok) { L.error('acquireToken', `HTTP ${r.status}`); return false; }
   try {
     const p = JSON.parse(r.body);
-    if (p.status !== 'success') { L.error('acquireToken', 'Non-success'); return false; }
+    if (p.status !== 'success') return false;
     conf.token = p.result.token;
     conf.role = p.result.role;
     conf.timer = setInterval(refreshToken, 60000);
-    L.info('acquireToken', 'Token acquired', { role: conf.role, display_name: p.result.display_name });
+    L.info('acquireToken', 'Token acquired', { role: conf.role });
     return true;
-  } catch (e) { L.error('acquireToken', e.message); return false; }
+  } catch { return false; }
 }
 async function refreshToken() {
   const r = await post(apiUrl('refresh_token'), hdrs(), '');
@@ -182,12 +188,11 @@ async function attach() {
   const svc = matchService(rawAlias);
   if (!svc) return false;
   const sid = await getSessionId(call.id);
-  if (!sid) { L.error('attach', 'No session ID'); return false; }
+  if (!sid) return false;
   conf.alias = cleanAlias(rawAlias);
   conf.sessionId = sid;
   conf.nodeURL = svc.nodeURL;
   conf.active = true;
-  L.info('attach', 'Connecting', { alias: conf.alias, sessionId: sid });
   if (!(await acquireToken())) { conf = freshState(); return false; }
   return true;
 }
@@ -202,7 +207,7 @@ async function dialOut(destination, protocol, role) {
   role = (role || 'GUEST').toUpperCase();
   const url = apiUrl('dial');
   const body = JSON.stringify({ destination, protocol, role });
-  L.info('dialOut', `Dialling ${destination}`, { protocol, role, url });
+  L.info('dialOut', `Dialling ${destination}`, { protocol, role });
   notify('Dialling...', `Calling ${destination}`, 3);
   const r = await post(url, hdrs(), body);
   if (!r.ok) {
@@ -249,27 +254,71 @@ function promptRole(destination) {
 }
 
 // ---------------------------------------------------------------------------
-//  Panel XML — mirrors call-macro's exact structure and element order
-//  ALWAYS uses Version 1.7 (call-macro does this too)
-//  Element order: PanelId → Origin → Type → Color → Name → ActivityType → Icon
+//  Search & pagination state
+// ---------------------------------------------------------------------------
+const searchState = {
+  query: null,
+  page: 1,
+};
+
+function getFilteredDirectory() {
+  if (!DIALOUT) return [];
+  const dir = DIALOUT.directory;
+  if (!searchState.query) return dir;
+  const q = searchState.query.toLowerCase();
+  return dir.filter(e =>
+    e.name.toLowerCase().includes(q) ||
+    e.address.toLowerCase().includes(q)
+  );
+}
+
+function getPagedDirectory() {
+  const filtered = getFilteredDirectory();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  if (searchState.page > totalPages) searchState.page = totalPages;
+  if (searchState.page < 1) searchState.page = 1;
+  const start = (searchState.page - 1) * PAGE_SIZE;
+  const page = filtered.slice(start, start + PAGE_SIZE);
+  return { entries: page, currentPage: searchState.page, totalPages, totalFiltered: filtered.length, startIndex: start };
+}
+
+// ---------------------------------------------------------------------------
+//  Panel XML with search + pagination
 // ---------------------------------------------------------------------------
 function buildPanel() {
   const dc = DIALOUT;
   const title = esc(dc.name);
+  const { entries, currentPage, totalPages, totalFiltered, startIndex } = getPagedDirectory();
 
-  // Build directory rows
-  const rows = dc.directory.slice(0, 20).map((e, i) => {
+  // Search row
+  const searchLabel = searchState.query
+    ? `Search: ${esc(searchState.query)} (${totalFiltered})`
+    : `${dc.directory.length} contacts`;
+
+  const searchRow = searchState.query
+    ? `<Row><n>${searchLabel}</n><Widget><WidgetId>${WID_CLEAR}</WidgetId><n>Clear</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`
+    : `<Row><n>${searchLabel}</n><Widget><WidgetId>${WID_SEARCH}</WidgetId><n>Search</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`;
+
+  // Directory entry rows
+  const rows = entries.map((e, i) => {
+    const globalIdx = startIndex + i;
     const proto = e.protocol !== 'auto' ? ` [${e.protocol.toUpperCase()}]` : '';
-    return `<Row><n>${esc(e.name + proto)}</n><Widget><WidgetId>${WIDGET}e${i}</WidgetId><Name/><Type>Button</Type><Options>size=1;icon=phone</Options></Widget></Row>`;
+    const label = esc(e.name + proto);
+    return `<Row><n>${label}</n><Widget><WidgetId>${WIDGET}e${globalIdx}</WidgetId><Name/><Type>Button</Type><Options>size=1;icon=phone</Options></Widget></Row>`;
   }).join('\n');
 
-  // XML structure matches call-macro's getPanelXML output exactly:
-  // - Version ALWAYS 1.7
-  // - Element order: PanelId, Origin, Type, Color, Name, ActivityType, Icon
-  // - No <Location> tag (1.7 doesn't support it)
-  const xml = `<Extensions>
-      <Version>1.7</Version>
-      <Panel>
+  // Pagination row (only if more than one page)
+  let navRow = '';
+  if (totalPages > 1) {
+    navRow = `<Row><n>Page ${currentPage} of ${totalPages}</n><Widget><WidgetId>${WID_PREV}</WidgetId><n>Prev</n><Type>Button</Type><Options>size=1</Options></Widget><Widget><WidgetId>${WID_NEXT}</WidgetId><n>Next</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`;
+  }
+
+  // Custom dial row
+  const customRow = `<Row><n>Custom Address</n><Widget><WidgetId>${WID_CUSTOM}</WidgetId><n>Dial</n><Type>Button</Type><Options>size=1</Options></Widget></Row>`;
+
+  return `<Extensions>
+<Version>1.7</Version>
+<Panel>
   <PanelId>${dc.panelId}</PanelId>
   <Origin>local</Origin>
   <Type>InCall</Type>
@@ -277,29 +326,34 @@ function buildPanel() {
   <n>${title}</n>
   <ActivityType>Custom</ActivityType>
   <Icon>${dc.icon}</Icon>
-    <Page>
-      <PageId>pex_do_page</PageId>
-      <n>${title}</n>
-${rows}
-<Row><Name/></Row>
-<Row><n>Custom Address</n><Widget><WidgetId>${WID_CUSTOM}</WidgetId><n>Dial</n><Type>Button</Type><Options>size=1</Options></Widget></Row>
-      <Options/>
-    </Page>
-      </Panel>
-    </Extensions>`;
+  <Page>
+    <n>${title}</n>
+    ${searchRow}
+    ${rows}
+    <Row><Name/></Row>
+    ${navRow}
+    ${customRow}
+    <Options/>
+  </Page>
+</Panel>
+</Extensions>`;
+}
 
-  L.info('buildPanel', 'XML built', { length: xml.length });
-  return xml;
+async function updatePanel() {
+  const panelId = DIALOUT.panelId;
+  const xml = buildPanel();
+  try {
+    await xapi.Command.UserInterface.Extensions.Panel.Save({ PanelId: panelId }, xml);
+  } catch (e) { L.error('updatePanel', e.message); }
 }
 
 async function deployPanel() {
   const panelId = DIALOUT.panelId;
   try { await xapi.Command.UserInterface.Extensions.Panel.Remove({ PanelId: panelId }); } catch { }
-  const xml = buildPanel();
-  try {
-    await xapi.Command.UserInterface.Extensions.Panel.Save({ PanelId: panelId }, xml);
-    L.info('deployPanel', 'OK');
-  } catch (e) { L.error('deployPanel', `Failed: ${e.message}`); }
+  searchState.query = null;
+  searchState.page = 1;
+  await updatePanel();
+  L.info('deployPanel', 'OK', { entries: DIALOUT.directory.length });
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +362,38 @@ async function deployPanel() {
 async function onWidget(event) {
   if (event.Type !== 'clicked' || !event.WidgetId.startsWith(WIDGET)) return;
   const wid = event.WidgetId;
+
+  // Search button
+  if (wid === WID_SEARCH) {
+    xapi.Command.UserInterface.Message.TextInput.Display({
+      FeedbackId: 'pex_do_search', InputType: 'SingleLine',
+      Title: 'Search Directory',
+      Text: `Search ${DIALOUT.directory.length} contacts by name or address.`,
+      Placeholder: 'Enter search term', SubmitText: 'Search',
+    }).catch(() => { });
+    return;
+  }
+
+  // Clear search
+  if (wid === WID_CLEAR) {
+    searchState.query = null;
+    searchState.page = 1;
+    await updatePanel();
+    return;
+  }
+
+  // Pagination
+  if (wid === WID_PREV) {
+    if (searchState.page > 1) { searchState.page--; await updatePanel(); }
+    return;
+  }
+  if (wid === WID_NEXT) {
+    const { totalPages } = getPagedDirectory();
+    if (searchState.page < totalPages) { searchState.page++; await updatePanel(); }
+    return;
+  }
+
+  // Custom dial
   if (wid === WID_CUSTOM) {
     xapi.Command.UserInterface.Message.TextInput.Display({
       FeedbackId: 'pex_do_custom', InputType: 'SingleLine',
@@ -317,6 +403,8 @@ async function onWidget(event) {
     }).catch(() => { });
     return;
   }
+
+  // Directory entry
   if (wid.startsWith(`${WIDGET}e`)) {
     const idx = parseInt(wid.replace(`${WIDGET}e`, ''), 10);
     const entry = DIALOUT.directory[idx];
@@ -327,17 +415,32 @@ async function onWidget(event) {
     await dialOut(entry.address, entry.protocol, role);
   }
 }
+
 async function onTextInput(event) {
-  if (event.FeedbackId !== 'pex_do_custom') return;
-  const addr = (event.Text || '').trim();
-  if (!addr) { notify('Dial Out', 'No address entered.', 3); return; }
-  let protocol = 'auto';
-  if (/^rtmps?:\/\//i.test(addr)) protocol = 'rtmp';
-  if (!(await attach())) return;
-  const role = await promptRole(addr);
-  if (!role) return;
-  await dialOut(addr, protocol, role);
+  // Search response
+  if (event.FeedbackId === 'pex_do_search') {
+    const q = (event.Text || '').trim();
+    if (!q) return;
+    searchState.query = q;
+    searchState.page = 1;
+    L.info('onTextInput', `Search: "${q}"`, { results: getFilteredDirectory().length });
+    await updatePanel();
+    return;
+  }
+
+  // Custom dial response
+  if (event.FeedbackId === 'pex_do_custom') {
+    const addr = (event.Text || '').trim();
+    if (!addr) { notify('Dial Out', 'No address entered.', 3); return; }
+    let protocol = 'auto';
+    if (/^rtmps?:\/\//i.test(addr)) protocol = 'rtmp';
+    if (!(await attach())) return;
+    const role = await promptRole(addr);
+    if (!role) return;
+    await dialOut(addr, protocol, role);
+  }
 }
+
 async function onPanelClick(event) {
   if (!DIALOUT || event.PanelId !== DIALOUT.panelId) return;
   const ok = await attach();
@@ -349,8 +452,13 @@ async function onPanelClick(event) {
   if (conf.role !== 'HOST') {
     notify('Dial Out', `Connected as ${conf.role}. Only Hosts can dial out.`, 5);
   }
+  // Refresh panel to show current page
+  await updatePanel();
 }
 
+// ---------------------------------------------------------------------------
+//  Init
+// ---------------------------------------------------------------------------
 async function init() {
   L.info('init', `Starting ${MACRO} ${VERSION}`);
   if (!(await loadSettings())) { L.error('init', 'Cannot start'); return; }
