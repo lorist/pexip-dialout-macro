@@ -37,20 +37,10 @@ The macro authenticates against the Pexip Client REST API using the active SIP s
 | Branch | File | Description |
 |--------|------|-------------|
 | **main** | `pexip-dialout-macro.js` | Static directory from settings macro |
-| **feature/remote-directory** | `pexip-dialout-macro-remote-directory.js` | Fetches directory from a URL with static fallback |
+| **feature/remote-directory** | `pexip-dialout-macro.js` | Fetches directory from a URL with static fallback |
 
 Both branches share the same `meeting-controls-settings.js` format — the feature branch adds optional fields.
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `pexip-dialout-macro.js` | Main branch macro — static directory |
-| `pexip-dialout-macro-remote-directory.js` | Feature branch macro — remote directory |
-| `meeting-controls-settings.js` | Settings macro (main branch example) |
-| `meeting-controls-settings-remote.js` | Settings macro (feature branch example) |
-| `directory.json` | Example remote directory file to host on a web server |
-| `README.md` | This file |
 
 ## Installation
 
