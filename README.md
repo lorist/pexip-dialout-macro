@@ -4,10 +4,11 @@ A Cisco CE/RoomOS macro that adds dial-out functionality to Pexip Infinity VMR c
 
 ## Overview
 
-When a Cisco endpoint is in an active Pexip Infinity conference, this macro presents a **Dial Out** panel in the call controls. From this panel, users can:
+When a Cisco endpoint is in an active Pexip Infinity conference, this macro adds a **Dial Out** action button to the call controls. Tapping it opens a prompt-based directory browser where users can:
 
-- Dial pre-configured directory contacts into the conference with one tap
-- Dial a custom address via a free-form text input
+- Browse a pre-configured contact directory with pagination
+- Search contacts by name or address
+- Dial a custom address via free-form text input
 - Choose whether each dialled participant joins as a **Guest** or **Host**
 
 The macro authenticates against the Pexip Client REST API using the active SIP session, automatically inheriting the caller's role — no PIN re-entry required.
@@ -15,11 +16,14 @@ The macro authenticates against the Pexip Client REST API using the active SIP s
 ## Features
 
 - **Host detection** — only conference Hosts can initiate dial-out; Guests see a notification
-- **Role selection prompt** — choose Guest or Host for each dialled participant
+- **Role selection** — choose Guest or Host for each dialled participant
+- **Directory search** — search by name or address across hundreds of contacts
+- **Pagination** — browse 3 contacts per page with Next/Previous navigation
 - **Protocol auto-detection** — uses `"auto"` by default, deferring to Pexip Call Routing Rules
 - **PIN handling** — extracts embedded PINs from the SIP dial string (e.g. `test**1234@domain`) or works transparently when PINs are entered via IVR/DTMF
-- **Standalone capable** — runs independently or alongside the Pexip Call Control Macro (call-macro)
+- **Standalone capable** — runs independently or alongside the Pexip Call Control Macro
 - **Self-configuring** — enables HttpClient and manages the HTTP Allow List automatically
+- **DX70/CE9 compatible** — uses Prompt dialogs for all UI, avoiding panel widget rendering issues on older firmware
 
 ## Requirements
 
@@ -33,12 +37,13 @@ The macro authenticates against the Pexip Client REST API using the active SIP s
 |------|-------------|
 | `pexip-dialout-macro.js` | The dial-out macro — upload as a macro and set to **On** |
 | `meeting-controls-settings.js` | Shared settings macro — upload as a macro (can be **On** or **Off**) |
+| `README.md` | This file |
 
 ## Installation
 
 ### 1. Configure the settings macro
 
-Edit `meeting-controls-settings.js` to match your environment. The key sections are:
+Edit `meeting-controls-settings.js` to match your environment.
 
 **`services`** — defines which Pexip node and conference aliases this macro handles:
 
@@ -56,10 +61,10 @@ Edit `meeting-controls-settings.js` to match your environment. The key sections 
 ```
 
 - `nodeURL` — your Pexip Conferencing Node's Client API base URL
-- `regex` — a regular expression matching the SIP aliases used to dial into your VMRs
-- The other fields (`layouts`, `shouldMCUMute`, `panelSettings`) are used by the call-macro if present; they are ignored by the dial-out macro but must exist for settings validation
+- `regex` — regular expression matching the SIP aliases used to dial into your VMRs
+- The other fields (`layouts`, `shouldMCUMute`, `panelSettings`) are used by the call-macro if present; ignored by the dial-out macro but must exist for settings validation
 
-**`dialOut`** — configures the dial-out panel and directory:
+**`dialOut`** — configures the panel button and contact directory:
 
 ```json
 "dialOut": {
@@ -68,18 +73,21 @@ Edit `meeting-controls-settings.js` to match your environment. The key sections 
   "icon": "Contacts",
   "color": "#1170CF",
   "directory": [
-    { "name": "Room Alpha", "address": "alpha@example.com", "protocol": "auto" },
-    { "name": "H.323 Room", "address": "10.0.1.50", "protocol": "auto" },
-    { "name": "Teams User", "address": "user@contoso.com", "protocol": "auto" }
+    { "name": "Sydney Boardroom", "address": "syd.boardroom@example.com" },
+    { "name": "Melbourne Conf A", "address": "mel.confa@example.com" },
+    { "name": "Jane Smith (Teams)", "address": "jane.smith@contoso.com" },
+    { "name": "Livestream", "address": "rtmp://stream.example.com/live/key", "protocol": "rtmp" }
   ]
 }
 ```
+
+The `protocol` field defaults to `"auto"` if omitted — most entries only need `name` and `address`. The directory is sorted alphabetically on load.
 
 ### 2. Upload to the endpoint
 
 1. Open the endpoint's web admin interface
 2. Navigate to **Customization → Macro Editor**
-3. Create a macro named `meeting-controls-settings`, paste the settings content, save (set to On or Off — either works)
+3. Create a macro named `meeting-controls-settings`, paste the settings content, save
 4. Create a macro named `pexip-dialout`, paste the macro content, save, and set to **On**
 
 ### 3. TLS Certificate
@@ -92,61 +100,90 @@ If your Pexip node uses an internal or self-signed CA certificate:
 
 Without this, the macro will fail with `SSL peer certificate or SSH remote key was not OK`.
 
+## User Guide
+
+### Dial-out flow
+
+1. Join a Pexip VMR conference from the Cisco endpoint
+2. Tap the **Dial Out** action button in the call controls
+3. Choose from the main menu:
+   - **Browse Directory** — page through contacts 3 at a time
+   - **Search by Name** — type a name or address fragment to filter
+   - **Dial Custom Address** — enter any SIP/H.323/Teams address
+4. Select a contact to see their name and address
+5. Choose **Dial as Guest** or **Dial as Host**
+6. The participant is dialled into the conference
+
+### Navigation
+
+- Prompts show 3 contacts per page with **Next →** and **← Previous** buttons
+- Search results are browseable with the same pagination
+- **Back** returns to the previous page; **Cancel** closes the dialog
+- If no results match a search, choose **Search Again** or **Browse All**
+
 ## Settings Reference
 
 ### `dialOut` object
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `panelId` | string | No | Panel identifier (default: `pex_dialout_panel`) |
-| `name` | string | No | Panel button label (default: `Dial Out`) |
-| `icon` | string | No | Panel icon name (default: `Contacts`) |
-| `color` | string | No | Panel button colour as hex (e.g. `#1170CF`) |
-| `directory` | array | Yes | Array of contact entries |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `panelId` | string | No | `pex_dialout_panel` | Panel identifier |
+| `name` | string | No | `Dial Out` | Action button label |
+| `icon` | string | No | `Contacts` | Button icon |
+| `color` | string | No | — | Button colour as hex (e.g. `#1170CF`) |
+| `directory` | array | Yes | — | Array of contact entries |
 
 ### Directory entry object
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | Yes | Display name shown on the panel button |
-| `address` | string | Yes | SIP URI, H.323 address, or Teams address to dial |
-| `protocol` | string | No | Protocol for the call (default: `auto`) |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | Yes | — | Display name shown in prompts |
+| `address` | string | Yes | — | SIP URI, H.323 address, or Teams address |
+| `protocol` | string | No | `auto` | Protocol for the call |
 
 ### Protocol values
 
 | Value | Description |
 |-------|-------------|
 | `auto` | Let Pexip Call Routing Rules determine the protocol (recommended) |
-| `sip` | Force SIP (may not work on all Pexip versions via Client API) |
 | `h323` | Force H.323 |
 | `mssip` | Microsoft Teams via Pexip CVI gateway |
 | `rtmp` | RTMP streaming target |
 
-> **Note:** On Pexip Infinity v35+ (version_id 40+), the Client API `/dial` endpoint requires `"auto"` for SIP calls routed via Call Routing Rules. Using `"sip"` directly returns `unsupported protocol 'sip'`.
+> **Note:** On Pexip Infinity v35+ (version_id 40+), the Client API `/dial` endpoint requires `"auto"` for SIP calls routed via Call Routing Rules. Using `"sip"` directly may return `unsupported protocol 'sip'`.
+
+### Scaling the directory
+
+The settings macro can hold **500+ directory entries** within the 64KB macro content limit. Each entry is approximately 100 bytes. The search and pagination features handle large directories efficiently — users can find contacts by name without scrolling through hundreds of entries.
+
+Minimal entry format (protocol defaults to `"auto"`):
+```json
+{ "name": "Room Alpha", "address": "alpha@example.com" }
+```
 
 ## How It Works
 
-### Authentication flow
+### Authentication
 
-1. The macro extracts the **SIP Session ID** from the active call via `xapi.Status.Conference.Call[n].Sip.SessionId`
-2. It sends `POST /api/client/v2/conferences/<sessionId>/request_token` — this inherits the SIP call's authentication context, so no PIN is needed
+1. The macro extracts the **SIP Session ID** from the active call
+2. It sends `POST /api/client/v2/conferences/<sessionId>/request_token` — this inherits the SIP call's authentication context, so no PIN is needed even for PIN-protected VMRs
 3. The token response includes the caller's `role` (`HOST` or `GUEST`)
-4. All subsequent API calls (dial, refresh, release) use the same session ID path
+4. All subsequent API calls use the same session ID path
 
-### Dial-out flow
+### Dial-out API
 
-1. User taps a directory contact or enters a custom address
-2. A prompt asks: "Dial as Guest or Host?"
-3. The macro sends `POST /api/client/v2/conferences/<sessionId>/dial` with `{ destination, protocol, role }`
-4. On-screen alerts show the dial-out status
+The macro sends `POST /api/client/v2/conferences/<sessionId>/dial` with:
+```json
+{ "destination": "user@example.com", "protocol": "auto", "role": "GUEST" }
+```
 
-### Running with the call-macro
+### Running with the Pexip Call Control Macro
 
-When running alongside the Pexip Call Control Macro (call-macro v1.8.0):
+When running alongside the call-macro (v1.8.0):
 
 - Both macros read from the same `meeting-controls-settings` macro
-- The `dialOut` section is ignored by the call-macro (it only validates its own expected fields)
-- HttpClient and Allow List setup is idempotent — safe for both macros to call
+- The `dialOut` section is ignored by the call-macro
+- HttpClient and Allow List setup is idempotent — safe for both macros
 - Each macro manages its own API token independently
 
 ### Running standalone
@@ -155,7 +192,7 @@ When running without the call-macro:
 
 - The macro enables `HttpClient.Mode` automatically
 - It extracts the Pexip hostname from `nodeURL` and adds it to the HTTP Allow List
-- The `services` array must still be present for alias matching and node URL resolution
+- The `services` array must still be present for alias matching
 
 ## Troubleshooting
 
@@ -164,40 +201,44 @@ When running without the call-macro:
 | Log message | Cause | Fix |
 |-------------|-------|-----|
 | `SSL peer certificate or SSH remote key was not OK` | Endpoint doesn't trust the Pexip TLS cert | Upload CA cert to endpoint |
-| `HTTP 403` on `request_token` | VMR has a host PIN and no SIP session context | Ensure you're in an active Pexip call before opening the panel |
-| `HTTP 400` on `dial` | Invalid protocol or request body | Use `"auto"` protocol; check Pexip admin logs for detail |
-| `unsupported protocol 'sip'` (Pexip log) | Pexip v35+ requires `"auto"` for Call Routing Rule-based dialling | Change protocol to `"auto"` in settings |
-| `No valid settings macro found` | Settings macro not found or missing required fields | Ensure macro is named `meeting-controls-settings` with `services` and `dialOut` sections |
-| Panel shows blank labels | DX70/CE9 XML rendering issue | Known issue on DX70; functionality works despite blank labels |
+| `HTTP 403` on `request_token` | No active SIP session to inherit auth from | Ensure you're in an active Pexip call before tapping Dial Out |
+| `HTTP 400` on `dial` | Invalid protocol or destination not routable | Use `"auto"` protocol; check Pexip admin logs |
+| `unsupported protocol 'sip'` (Pexip log) | Pexip v35+ requires `"auto"` for Call Routing Rules | Change protocol to `"auto"` |
+| `No valid settings macro found` | Settings macro missing or incomplete | Ensure macro is named `meeting-controls-settings` with `services` and `dialOut` |
+| `Only Hosts can dial out` | Caller joined as Guest | Join with Host PIN or configure VMR to grant Host role |
 
-### Checking the logs
+### Viewing logs
 
-Macro logs appear in the endpoint's macro console. Filter for `pexip-dialout` to see only this macro's output. Key log entries:
+Macro logs appear in the endpoint's macro console (**Customization → Macro Editor → Console**). Filter for version string `v4.1.0` to see only this macro's output:
 
 ```
-v3.2.0 INFO  [loadSettings] Loaded from "meeting-controls-settings"
-v3.2.0 INFO  [acquireToken] Token acquired {"role":"HOST",...}
-v3.2.0 INFO  [dialOut] Success: user@example.com {"result":["uuid..."]}
+v4.1.0 INFO  [loadSettings] Loaded from "meeting-controls-settings"
+v4.1.0 INFO  [acquireToken] Token acquired {"role":"HOST"}
+v4.1.0 INFO  [dialOut] Success: user@example.com {"result":["uuid..."]}
 ```
 
 ### Pexip admin logs
 
-If dial-out fails with a 400, check the Pexip Infinity admin logs for the specific error. Navigate to **Status → Logs** on the management node and search for `REST API call failed`.
+If dial-out fails with a 400, check the Pexip Infinity admin logs (**Status → Logs**) and search for `REST API call failed` to see the specific error.
 
-## Known Issues
+## DX70/CE9 Notes
 
-- **DX70 panel labels** — row names and page titles may not render on DX70 endpoints running CE9.x firmware. The buttons are functional and the role selection prompt displays contact names correctly. This is a firmware-level UI Extensions rendering limitation.
-- **Multiple concurrent tokens** — both this macro and the call-macro request separate API tokens for the same conference. This is by design and Pexip handles multiple tokens per conference without issue.
+The macro uses Prompt dialogs (`Message.Prompt.Display`) for all user interaction rather than panel widgets. This is because the DX70 running CE9.x firmware has a known limitation where `<n>` (lowercase) tags in programmatically saved panel XML are not rendered — resulting in blank labels. Prompt dialogs render text correctly on all CE9 endpoints.
+
+The action button label uses `<Name>` (capital N) which is the format the DX70's native UI Extensions editor exports.
 
 ## Version History
 
 | Version | Changes |
 |---------|---------|
-| v3.2.0 | Current release — standalone capable, host check, role selection, session ID auth |
+| v4.1.0 | Current — `<Name>` tag for DX70 button label |
+| v4.0.0 | Prompt-based UI replacing panel widgets |
+| v3.x | Panel widget iterations (blank labels on DX70) |
+| v3.0.0 | Standalone capable (HttpClient, Allow List) |
 | v2.3.0 | Session ID for all API paths; protocol `"auto"` |
-| v2.0.0 | Clean rewrite with host detection and role selection prompt |
-| v1.1.0 | Initial release — companion to call-macro |
+| v2.0.0 | Host check, role selection prompt |
+| v1.1.0 | Initial release |
 
 ## License
 
-This macro is provided as-is for use with Pexip Infinity and Cisco video endpoints. Not affiliated with or endorsed by Cisco Systems or Pexip.
+This macro is provided as-is for use with Pexip Infinity and Cisco video endpoints.
